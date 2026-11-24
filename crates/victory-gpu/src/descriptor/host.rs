@@ -617,6 +617,41 @@ fn whole_uav(texture: &ID3D12Resource) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// A depth target's twin is typeless: views name a format of its family; a
+/// depth one, the typeless one or none becomes `format`, the one with the
+/// depth's bits. The twin of a two-plane depth (`depth`, its host format)
+/// holds the depth plane only: views of that plane become views of the
+/// twin's one plane, and views of the stencil plane (by plane or by
+/// format) are refused (`false`) rather than given the depth.
+fn twin_view(depth: u32, format: u32, d: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) -> bool {
+    use crate::resource::{DEPTH_FORMATS, family, planar_twin};
+    const STENCIL_PLANE: u32 = 22; // X32_TYPELESS_G8X24_UINT
+    let own = d.Format.0 as u32;
+    // SAFETY: the union member of the view's dimension.
+    let plane = unsafe {
+        match d.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => &mut d.Anonymous.Texture2D.PlaneSlice,
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => &mut d.Anonymous.Texture2DArray.PlaneSlice,
+            _ => return !planar_twin(depth),
+        }
+    };
+    if planar_twin(depth) {
+        if *plane != 0 || own == STENCIL_PLANE {
+            return false;
+        }
+        *plane = 0;
+    }
+    let depth_plane = planar_twin(depth) && family(own) == family(depth);
+    if own == 0
+        || own == family(format)
+        || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
+        || depth_plane
+    {
+        d.Format.0 = format as i32;
+    }
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -676,16 +711,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
-            // A depth target's twin is typeless: views name a format of its
-            // family; a depth one, the typeless one or none becomes the one
-            // with the depth's bits.
             if let Some(format) = twin_format {
-                use crate::resource::{DEPTH_FORMATS, family};
                 let d = desc.get_or_insert_with(|| whole_uav(texture));
-                let own = d.Format.0 as u32;
-                if own == 0 || own == family(format) || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
-                {
-                    d.Format.0 = format as i32;
+                // SAFETY: a live resource (the depth the twin stands in for).
+                let depth = crate::resource::host_resource(resource)
+                    .map_or(0, |t| unsafe { t.GetDesc() }.Format.0 as u32);
+                if !twin_view(depth, format, d) {
+                    once!(
+                        format = d.Format.0,
+                        depth,
+                        "unordered access to the stencil plane of a depth target: refused"
+                    );
+                    return None;
                 }
             }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
@@ -886,6 +923,53 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn twin_views_of_depth_with_stencil_never_reach_the_stencil_plane() {
+        let view = |format: u32, dimension, plane: u32| {
+            let mut d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT(format as i32),
+                ViewDimension: dimension,
+                ..Default::default()
+            };
+            // The member of the dimension set above (plain stores).
+            if dimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+                d.Anonymous.Texture2D.PlaneSlice = plane;
+            } else {
+                d.Anonymous.Texture2DArray.PlaneSlice = plane;
+            }
+            d
+        };
+        for dimension in [
+            D3D12_UAV_DIMENSION_TEXTURE2D,
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+        ] {
+            // Depth plane, by depth, typeless, color or no format: R32_FLOAT,
+            // or R32_UINT as asked.
+            for (asked, wanted) in [
+                (20, 41),
+                (19, 41),
+                (21, 41),
+                (0, 41),
+                (41, 41),
+                (42, 42),
+                (39, 41),
+            ] {
+                let mut d = view(asked, dimension, 0);
+                assert!(twin_view(19, 41, &mut d), "format {asked}");
+                assert_eq!(d.Format.0 as u32, wanted, "format {asked}");
+            }
+            // The stencil plane, by plane or by format: refused.
+            for (asked, plane) in [(42, 1), (41, 1), (20, 1), (22, 0), (22, 1)] {
+                let mut d = view(asked, dimension, plane);
+                assert!(!twin_view(19, 41, &mut d), "format {asked} plane {plane}");
+            }
+            // One-plane depth keeps #469's behavior.
+            let mut d = view(55, dimension, 0);
+            assert!(twin_view(53, 56, &mut d));
+            assert_eq!(d.Format.0, 56);
+        }
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
