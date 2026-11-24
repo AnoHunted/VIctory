@@ -932,13 +932,30 @@ impl<'a> Lower<'a> {
     /// Execution State"). Only the wave count is derived, so the value is
     /// given only to programs that read nothing but bits 5:0 of it.
     fn group_info(&mut self, v: Value) -> Val {
+        // A phi forwards all bits of each incoming value. Check consumers of
+        // its result too, including loop-carried joins.
+        let mut joins = HashMap::<Value, Vec<Value>>::new();
+        for phi in self.x.p.blocks.iter().flat_map(|b| &b.phis) {
+            for &arg in &phi.args {
+                joins.entry(arg).or_default().push(phi.value);
+            }
+        }
+        let mut values = HashSet::from([v]);
+        let mut pending = vec![v];
+        while let Some(value) = pending.pop() {
+            for &joined in joins.get(&value).into_iter().flatten() {
+                if values.insert(joined) {
+                    pending.push(joined);
+                }
+            }
+        }
         let low = |o: &Operand| match *o {
             Operand::Literal(k) => Some(k),
             Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
             _ => None,
         };
         let only_count = self.x.p.blocks.iter().flat_map(|b| &b.insts).all(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
+            if !i.reads.iter().any(|r| values.contains(&r.1)) {
                 return true;
             }
             let Fields::Sop { src, .. } = &i.fields else {
@@ -6592,10 +6609,71 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
-    use crate::{io, ir, resource, structure};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
+    use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn thread_group_info_is_checked_through_a_phi() {
+        for masked in [true, false] {
+            let mut words = vec![
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0001, // s_cbranch_scc1 join
+                0xBE82_0380, // s_mov_b32 s2, 0
+            ];
+            if masked {
+                words.push(0x8702_BF02); // join: s_and_b32 s2, s2, 63
+            }
+            words.extend([
+                0xBF06_8202, // s_cmp_eq_u32 s2, 2 (the wave count)
+                0xBF85_0001, // s_cbranch_scc1 -> second s_endpgm
+                S_ENDPGM,
+                S_ENDPGM,
+            ]);
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 2 << 1 | 1 << 10, // s2 is thread-group info
+                    threads: [64, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            assert!(
+                p.blocks
+                    .iter()
+                    .flat_map(|b| &b.phis)
+                    .any(|phi| phi.reg == super::Reg::S(2))
+            );
+            let result = lower_test_program(&native, &p);
+            if masked {
+                assert!(result.is_ok(), "expected a low-field read to translate");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ShaderError::Unsupported {
+                            what: "the thread-group info SGPR above the wave count",
+                            ..
+                        })
+                    ),
+                    "expected a full-width read to be refused, got {result:?}"
+                );
+            }
+        }
+    }
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
@@ -6613,12 +6691,16 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let st = structure::structure(&p).unwrap();
+        lower_test_program(&native, &p)
+    }
+
+    fn lower_test_program(native: &NativeProgram, p: &ir::Program) -> Result<(), ShaderError> {
+        let res = resource::track(p, &native.layout, native.stage).unwrap();
+        let io = io::raise(p, native).unwrap();
+        let st = structure::structure(p).unwrap();
         lower(&Parts {
-            native: &native,
-            p: &p,
+            native,
+            p,
             st: &st,
             io: &io,
             res: &res,
