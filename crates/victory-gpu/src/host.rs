@@ -1008,7 +1008,84 @@ impl HostList {
             if !barriers.is_empty() {
                 self.list.ResourceBarrier(&barriers);
             }
-            self.list.CopyResource(&dst.texture, &src.texture);
+            match dst.planes.as_ref().or(src.planes.as_ref()) {
+                Some(planes) => self.copy_depth_plane(&dst.texture, &src.texture, planes),
+                None => self.list.CopyResource(&dst.texture, &src.texture),
+            }
+        }
+    }
+
+    /// Records a copy of every subresource of the depth plane of a two-plane
+    /// depth target into its twin, or of the twin into that plane (`dst`
+    /// and `src` in the copy states): through the twin's buffer `planes`,
+    /// laid out as the twin's subresources in R32_TYPELESS, the format
+    /// D3D12 gives that plane's placed footprints. The stencil plane is not
+    /// touched.
+    fn copy_depth_plane(
+        &self,
+        dst: &ID3D12Resource,
+        src: &ID3D12Resource,
+        planes: &ID3D12Resource,
+    ) {
+        let Some(host) = host() else { return };
+        // SAFETY: live resources.
+        let (dd, sd) = unsafe { (dst.GetDesc(), src.GetDesc()) };
+        let twin = if crate::resource::planar_twin(dd.Format.0 as u32) {
+            sd
+        } else {
+            dd
+        };
+        let count = u32::from(twin.MipLevels) * u32::from(twin.DepthOrArraySize);
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+        // SAFETY: outputs sized for `count` subresources; the buffer was
+        // sized by the same query when the twin was made.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &twin,
+                0,
+                count,
+                0,
+                Some(footprints.as_mut_ptr()),
+                None,
+                None,
+                None,
+            );
+        }
+        let buffer = planes;
+        let at = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed for the call only; no reference is taken.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i,
+            },
+        };
+        let laid = |f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+        };
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let (to, from) = (
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        // SAFETY: an open list; live resources in the copy states; plane 0's
+        // subresources are numbered as the twin's.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(buffer, common, to)]);
+            for (i, &f) in (0..count).zip(&footprints) {
+                self.list
+                    .CopyTextureRegion(&laid(f), 0, 0, 0, &at(src, i), None);
+            }
+            self.list.ResourceBarrier(&[transition(buffer, to, from)]);
+            for (i, &f) in (0..count).zip(&footprints) {
+                self.list
+                    .CopyTextureRegion(&at(dst, i), 0, 0, 0, &laid(f), None);
+            }
+            self.list
+                .ResourceBarrier(&[transition(buffer, from, common)]);
         }
     }
 
@@ -1479,6 +1556,42 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
+    /// A buffer in GPU memory, in the common state, for copies only.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; the out pointer is ours.
+        unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+        }
+        buffer
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
